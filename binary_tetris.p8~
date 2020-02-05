@@ -1,0 +1,426 @@
+pico-8 cartridge // http://www.pico-8.com
+version 18
+__lua__
+well_width = 8
+well_height = 16
+well_addr = 0x4300
+cell_size = flr(128/well_height)-1
+f = 0
+timestep = 0
+timestep_interval = 4
+rows_cleared = 0
+--[[
+Well Representation
+
+The well is a well_width*well_heght/8 byte array in which each
+position is indicated by a bit (1 == occupied, 0 == free) and each row
+is represented by 10 contiguous bits ranging over two bytes.
+
+The following visual diagram is a helpful visual aid:
+
+  |1|2|3|4|5|6|7|8|
+  -----------------
+1 |0|0|0|0|0|0|0|0|
+2 |0|0|0|0|0|0|0|0|
+3 |0|0|0|0|0|0|0|0|
+4 |0|0|0|0|0|0|0|0|
+5 |0|0|0|0|0|0|0|0|
+6 |0|0|0|0|0|0|0|0|
+7 |0|0|0|0|0|0|0|0|
+8 |0|0|0|0|0|0|0|0|
+9 |0|0|0|0|0|0|0|0|
+11|0|0|0|0|0|0|0|0|
+12|0|0|0|0|0|0|0|0|
+13|0|0|0|0|0|0|0|0|
+14|0|0|0|0|0|0|0|0|
+15|0|0|0|0|0|0|0|0|
+16|0|0|0|0|0|0|0|0|
+  -----------------
+   1 1 1 1 1 1 1 1
+--]]
+
+local cur_addr = well_addr+well_height+2
+local cur_width = 4
+local cur_height = 4
+local cur_y = -4
+local cur_x = 4
+local cur_bin = 0
+
+--[[
+pieces
+]]
+--
+pieces = {
+   0b1100110000000000, --o
+   0b1000100010001000, --i
+   0b1100100010000000, --l
+   0b1100010001000000, --j
+   0b1110010000000000, --t
+   0b1100011000000000, --z
+   0b0110110000000000  --s
+}
+
+function bin_pos_is_bool(_bin, _pos)
+   return band(_bin, rotl(1, 16-_pos)) != 0
+end
+
+function dprint_bin(_bin, _size)
+   local print_str = ""
+   for i=1, _size or 16 do
+      print_str = print_str .. (bin_pos_is_bool(_bin, i) and 1 or 0)
+   end
+   printh(print_str)
+end
+   --[[
+      0b1001010100001111
+      |c1|c2|c3|c4|
+    r1|1 |0 |0 |1 |
+    r2|0 |1 |0 |1 |
+    r3|0 |0 |0 |0 |
+    r4|1 |1 |1 |1 |
+      ==
+      |c1|c2|c3|c4|
+    r1|1 |0 |0 |1 |
+    r2|0 |1 |0 |1 |
+    r3|0 |0 |0 |1 |
+    r4|1 |1 |0 |1 |            
+
+      give 4 rows to 16 bit binary by mod 4
+      0b1001010100001111
+      ==
+      1001
+      0101
+      0000
+      1111
+      t ==
+      1001
+      0101
+      0001
+      1101
+      ==
+      0b1001010100011101
+   --]]
+function transpose_bin(_bin)
+   local buff_array = {}
+   for i = 1, 16 do
+      local c = ((i-1) % 4)+1
+      local r = flr((i-1) / 4)+1
+      if c == 1 then
+	 add(buff_array, {})
+      end
+      buff_array[r][c] = bin_pos_is_bool(_bin, i)
+   end
+
+   local trans_array = {}
+   for r=1, #buff_array do
+      for c=1, #buff_array[r] do
+	 if not trans_array[c] then
+	    add(trans_array, {})
+	 end
+	 trans_array[c][r] = buff_array[r][c]
+      end
+   end
+   
+   local trans_bin = 0
+   for r=1, #trans_array do
+      for c=1, #trans_array[r] do
+	 trans_bin = bor(trans_bin, shl(trans_array[r][c] and 1 or 0, 15-(r*4)+c))
+      end
+   end
+
+   return trans_bin
+end
+
+function project_piece_col(_bin)
+   for i = 1, 4 do
+      local bitmask = shl(0x000f, (i-1)*4)
+      local applied_bm = band(_bin, bitmask)
+      --[[ 
+	 problem is that project piece col is not detecting if piece
+	 is going off side
+      --]]
+      local row_val = rotr(applied_bm, (i-2)*4)
+
+      local cur_row_val = rotr(row_val, cur_x-1)
+      
+      if band(peek(well_addr+cur_y+i-1), cur_row_val) != 0 -- well
+	 or band(0x0000.ffff, cur_row_val) != 0 -- right
+	 or band(0xff00, cur_row_val) != 0 -- left
+      then
+      	 return true
+      end
+   end
+
+   return false
+end
+
+function _init()
+   init_well()
+   init_cur()
+end
+
+function init_well()
+   for i=1, flr(well_width*well_height/8) do
+      poke(well_addr+(i-1), 0) 
+   end
+   poke(well_addr+flr(well_width*well_height/8), 0xff)
+end
+
+function update_well()
+   clear_well()
+   pulldown_well()
+end
+
+function instantiate_piece(_piece_bin)   
+   cur_bin = _piece_bin
+
+   for i = 1, 4 do
+      local bitmask = shl(0x000f, (i-1)*4)
+      local applied_bm = band(_piece_bin, bitmask)
+      local normalized = rotr(applied_bm, (i-2)*4)
+      --[[
+      printh("piece")
+      dprint_bin(_piece_bin)
+      printh("bm")
+      dprint_bin(bitmask)
+      printh("applied")
+      dprint_bin(applied_bm)
+      printh("normalized")
+      dprint_bin(normalized)
+      --]]
+      poke(cur_addr+i-1, rotr(normalized, cur_x-1))
+   end
+end
+
+
+
+function init_cur()
+   for i=1, 4 do
+      for j=1, 4 do
+   	 poke(cur_addr+i+j, 0)
+      end
+   end
+   cur_x = 4
+   cur_y = -4
+   local p = flr(rnd(#pieces))+1   
+   instantiate_piece(pieces[p])
+end
+
+function is_right_move_free()
+   -- peek at well x axis + 1   
+   for row_num=2, cur_height+1 do
+      -- is right wall
+      local cur_row_val = peek(cur_addr + row_num-2)
+      local well_row_val = peek(well_addr+cur_y-1+row_num-1)      
+      if band(1, cur_row_val) != 0 or band(shr(cur_row_val, 1), well_row_val) != 0 then
+	 return false
+      end
+   end
+   return true
+end
+
+function is_left_move_free()
+   -- peek at well x axis + 1
+   for row_num=2, cur_height+1 do
+      local cur_row_val = peek(cur_addr + row_num-2)
+      local well_row_val = peek(well_addr+cur_y-1+row_num-1)      
+      if band(0b10000000, cur_row_val) != 0 or band(shl(cur_row_val, 1), well_row_val) != 0 then
+	 return false
+      end
+   end
+   return true
+end
+
+function player()
+   if btnp(0) and is_left_move_free() then
+      cur_x -= 1
+      for row_num=1, cur_height do
+	 poke(cur_addr+row_num-1, shl(peek(cur_addr+row_num-1), 1))
+      end
+   end
+   if btnp(1) and is_right_move_free() then
+      cur_x += 1
+      for row_num=1, cur_height do
+	 poke(cur_addr+row_num-1, shr(peek(cur_addr+row_num-1), 1))
+      end
+   end
+   if btnp(4) then
+      local t_bin = transpose_bin(cur_bin)
+      if not project_piece_col(t_bin) then
+	 instantiate_piece(t_bin)
+      end
+   end
+end
+
+function update_cur()
+   -- gravity
+   cur_y += 1
+   -- detect set
+   if detect_under() then
+      for row_num=1, cur_height do
+	 poke(well_addr+row_num+cur_y-2,
+	      bor(peek(well_addr+row_num+cur_y-2),
+		  peek(cur_addr+row_num-1)))
+      end
+      if cur_y <= -3 then
+	 init_well()
+	 init_cur()
+	 rows_cleared = 0
+      else
+	 init_cur()
+      end
+   end
+end
+
+
+function detect_under()
+   for row_num=1, cur_height do
+      if well_addr+row_num-1+cur_y >= well_addr and
+	 band(peek(cur_addr+row_num-1),
+	      peek(well_addr+row_num-1+cur_y)) > 0 then
+	 return true
+      end
+   end
+   return false
+end
+
+function pulldown_well()   
+   for row_count=1, well_height-1 do
+      local row_val = get_row_val(row_count)
+      local next_row = get_row_val(row_count+1)
+      if next_row == 0 then
+	 poke(well_addr+row_count-1, 0)
+	 poke(well_addr+row_count, row_val)
+      end
+   end
+end
+
+function clear_well()
+   for row_count=1, well_height do
+      if get_row_val(row_count) == 0xff then
+	 poke(well_addr+row_count-1, 0)
+	 rows_cleared += 1
+      end
+   end
+end
+
+function draw_row(_row_num)
+   for i=1, well_width do
+      local x,y = cell_size*(i-1),
+      cell_size*(_row_num-1)
+      
+      local xe,ye = x+cell_size,
+      y+cell_size
+
+
+      if get_cell_val(get_row_val(_row_num), i) then
+	 rectfill(x,y,xe,ye,2)
+      end
+      rect(x,y,xe,ye,1)
+   end
+end
+
+function draw_well()
+   for i=1, well_height do
+      draw_row(i)
+   end
+end
+
+function draw_cur()
+   for row_num=1, 4 do
+      for col_num=1, 8 do
+	 local x,y = cell_size*(col_num-1),
+	 cell_size*(row_num-1)+((cur_y-1)*cell_size)
+	 
+	 local xe,ye = x+cell_size,
+	 y+cell_size
+
+	 if band(shl(1,8-col_num), peek(cur_addr+row_num-1)) > 0 then
+	    rectfill(x,y,xe,ye,4)
+	 end
+      end
+   end
+end
+
+function get_cell_val(_row, _col_num)
+   assert(in_range(_col_num, 1, well_width))
+   return band(2^(well_width - _col_num), _row) > 0
+end
+
+function set_cell(_row_num, _col_num, _value)
+end
+
+function in_range(_x, _min, _max)
+   return _x >= _min and _x <= _max
+end
+
+function clamp(_x, _min, _max)
+   return _x < _min and _min or (_x > _max and _max or _x)
+end
+
+function get_row_val(_row_num)
+   assert(in_range(_row_num, 1, well_height), "_row_num = ", _row_num)
+   return peek(well_addr+_row_num-1)
+end
+
+function bool_to_str(_bool)
+   return _bool and "true" or "false"
+end
+
+function dprint_well()
+   printh("timestep: " .. timestep)
+   for i=1, well_height do
+      local row = get_row_val(i)
+      local row_str = ""
+      if i >= 10 then
+	 row_str = "" .. i .. ": "
+      else
+	 row_str = "" .. i .. " : "
+      end
+      for j=1, well_width do
+	 row_str = row_str .. (get_cell_val(row, j) and 1 or 0)
+      end
+      printh(row_str)
+   end
+end
+
+function dprint_cur()
+   printh("timestep: " .. timestep)
+   for i=1, cur_height do
+      local row = peek(cur_addr+i-1)
+      local row_str = ""
+      if i >= 10 then
+	 row_str = "" .. i .. ": "
+      else
+	 row_str = "" .. i .. " : "
+      end
+      for j=1, 8 do
+	 row_str = row_str .. (get_cell_val(row, j) and 1 or 0)
+      end
+      printh(row_str)
+   end
+end
+
+function _update()
+   player()
+
+   if f % timestep_interval == 0 then
+      --dprint_well()
+      --dprint_cur()
+      update_well()
+      update_cur()
+      timestep += 1      
+   end
+   f += 1
+end
+
+function draw_score()
+   print(rows_cleared, cell_size*well_width+2, 2, 10)
+end
+
+function _draw()
+   cls()
+   draw_cur()
+   draw_well()
+   draw_score()
+end
